@@ -1,0 +1,390 @@
+SET ThousandSep=',';
+SET DecimalSep='.';
+SET MoneyThousandSep=',';
+SET MoneyDecimalSep='.';
+SET MoneyFormat='$ ###0.00;-$ ###0.00';
+SET TimeFormat='h:mm:ss TT';
+SET DateFormat='M/D/YYYY';
+SET TimestampFormat='M/D/YYYY h:mm:ss[.fff] TT';
+SET FirstWeekDay=6;
+SET BrokenWeeks=1;
+SET ReferenceDay=0;
+SET FirstMonthOfYear=1;
+SET CollationLocale='en-US';
+SET CreateSearchIndexOnReload=1;
+SET MonthNames='Jan;Feb;Mar;Apr;May;Jun;Jul;Aug;Sep;Oct;Nov;Dec';
+SET LongMonthNames='January;February;March;April;May;June;July;August;September;October;November;December';
+SET DayNames='Mon;Tue;Wed;Thu;Fri;Sat;Sun';
+SET LongDayNames='Monday;Tuesday;Wednesday;Thursday;Friday;Saturday;Sunday';
+SET NumericalAbbreviation='3:k;6:M;9:G;12:T;15:P;18:E;21:Z;24:Y;-3:m;-6:μ;-9:n;-12:p;-15:f;-18:a;-21:z;-24:y';
+
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//Connection
+LIB CONNECT TO 'JHU REST';
+LET vBaseURL = 'https://covid19api.herokuapp.com';
+LET vURL = vBaseURL & '/confirmed';
+
+// SQL Fields
+LET vSQLFormatDate = 'M/D/YY';
+LET vStartDate     = Date#('1/22/20', vSQLFormatDate);
+LET vEndDate       = Date#(Today(), vSQLFormatDate);
+LET vSQLDates      = '"__FK_history"';
+
+Do While vStartDate <= vEndDate
+	LET i = Date(vStartDate, vSQLFormatDate);
+	LET vSQLDates = vSQLDates & ', "$(i)"';
+	LET vStartDate = vStartDate + 1;
+LOOP
+//Trace $(vSQLDates);
+
+
+// Query Endpoint
+RestConnectorMasterTable:
+SQL SELECT 
+	"latest" AS "latest_u0",
+	"__KEY_root",
+	(SELECT 
+		"country",
+		"country_code",
+		"latest",
+		"province",
+		"__KEY_locations",
+		"__FK_locations",
+		(SELECT 
+			"latitude",
+			"longitude",
+			"__FK_coordinates"
+		FROM "coordinates" FK "__FK_coordinates"),
+		(SELECT 
+			$(vSQLDates)
+		FROM "history" FK "__FK_history")
+	FROM "locations" PK "__KEY_locations" FK "__FK_locations")
+FROM JSON (wrap on) "root" PK "__KEY_root"
+WITH CONNECTION (
+	URL "$(vURL)"  
+);
+
+
+[locations]:
+LOAD	
+	[country] as Country,
+	[country_code],
+	[province],
+	[__KEY_locations] as CountryKey
+RESIDENT RestConnectorMasterTable
+WHERE NOT IsNull([__FK_locations]);
+
+Mapping_Confirmed_Province_CountryKey:
+Mapping
+Load Distinct
+	if(province='nan',  country&'-'&province, province) as MapProvince,
+	[__KEY_locations] as [MapKeyLoc]
+RESIDENT RestConnectorMasterTable
+WHERE NOT IsNull([__FK_locations]); 
+
+[history_confirmed]:
+NoConcatenate
+LOAD	
+	__FK_history as CountryKey,
+    	*
+RESIDENT RestConnectorMasterTable
+WHERE NOT IsNull([__FK_history]);
+Drop Fields [__KEY_root], [__KEY_locations], [__FK_locations], __extra_ from history_confirmed;
+Drop Fields [__FK_coordinates], latitude, longitude, country, country_code, province from history_confirmed; 
+Drop Fields latest, latest_u0 from history_confirmed;
+Drop Field [__FK_history] from history_confirmed;
+
+auxData:
+CrossTable(auxDate, Confirmed, 1)
+Load 
+	*
+Resident history_confirmed;
+Drop table history_confirmed;
+
+Facts:
+NoConcatenate
+LOAD 
+	Floor(Num(Date#(auxDate))) as DateKey,
+	Date#(auxDate) as Date, 
+	Confirmed,
+    	If(Confirmed - Previous(Confirmed) < 0 or IsNull(Confirmed - Previous(Confirmed)), 
+    		0, 
+        	Confirmed - Previous(Confirmed)) as DailyConfirmed, 
+    	CountryKey
+RESIDENT auxData;
+DROP TABLE auxData;
+DROP TABLE RestConnectorMasterTable;
+
+
+// ///////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////
+LET vURL = vBaseURL & '/deaths';
+RestConnectorMasterTable:
+SQL SELECT 
+	"latest" AS "latest_u0",
+	"__KEY_root",
+	(SELECT 
+		"country",
+		"country_code",
+		"latest",
+		"province",
+		"__KEY_locations",
+		"__FK_locations",
+		(SELECT 
+			"latitude",
+			"longitude",
+			"__FK_coordinates"
+		FROM "coordinates" FK "__FK_coordinates"),
+		(SELECT 
+			$(vSQLDates)
+		FROM "history" FK "__FK_history")
+	FROM "locations" PK "__KEY_locations" FK "__FK_locations")
+FROM JSON (wrap on) "root" PK "__KEY_root"
+WITH CONNECTION (  
+	URL "$(vURL)"  
+);
+
+Mapping_Deaths_CountryKey_Province:
+Mapping
+Load Distinct
+	[__KEY_locations] as [MapKeyLoc],
+	if(province='nan',  country&'-'&province , province) as MapProvince
+RESIDENT RestConnectorMasterTable
+WHERE NOT IsNull([__FK_locations]); 
+
+[history_deaths]:
+NoConcatenate
+LOAD
+   	__FK_history as CountryKey_aux,
+	*
+RESIDENT RestConnectorMasterTable
+WHERE NOT IsNull([__FK_history]);
+Drop Fields [__KEY_root], [__KEY_locations], [__FK_locations], __extra_ from history_deaths;
+Drop Fields [__FK_coordinates], latitude, longitude, country, country_code, province from history_deaths; 
+Drop Fields latest, latest_u0 from history_deaths;
+Drop Field [__FK_history] from history_deaths;
+
+auxData:
+CrossTable(auxDate, Deaths, 1)
+Load 
+	*
+Resident history_deaths;
+Drop table history_deaths;
+
+Left Join (Facts)
+LOAD
+	Floor(Num(Date#(auxDate))) as DateKey,
+	Date#(auxDate) as Date,
+	Deaths,
+    	If(Deaths - Previous(Deaths) < 0 or IsNull(Deaths - Previous(Deaths)), 
+    		0, 
+       		Deaths - Previous(Deaths)) as DailyDeaths, 	 
+	ApplyMap('Mapping_Confirmed_Province_CountryKey',
+     		ApplyMap('Mapping_Deaths_CountryKey_Province', CountryKey_aux, ''), '') as CountryKey
+RESIDENT auxData;
+DROP TABLE auxData;
+DROP TABLE RestConnectorMasterTable;
+
+// ///////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////
+LET vURL = vBaseURL & '/recovered';
+RestConnectorMasterTable:
+SQL SELECT 
+	"latest" AS "latest_u0",
+	"__KEY_root",
+	(SELECT 
+		"country",
+		"country_code",
+		"latest",
+		"province",
+		"__KEY_locations",
+		"__FK_locations",
+		(SELECT 
+			"latitude",
+			"longitude",
+			"__FK_coordinates"
+		FROM "coordinates" FK "__FK_coordinates"),
+		(SELECT 
+			$(vSQLDates)
+		FROM "history" FK "__FK_history")
+	FROM "locations" PK "__KEY_locations" FK "__FK_locations")
+FROM JSON (wrap on) "root" PK "__KEY_root"
+WITH CONNECTION (  
+	URL "$(vURL)"  
+);
+
+Mapping_Recovered_CountryKey_Province:
+Mapping
+Load Distinct
+	[__KEY_locations] as [MapKeyLoc],
+	if(province='nan',  country&'-'&province , province) as MapProvince
+RESIDENT RestConnectorMasterTable
+WHERE NOT IsNull([__FK_locations]); 
+
+[history_recovered]:
+NoConcatenate
+LOAD
+    	__FK_history as CountryKey_aux,
+	*
+RESIDENT RestConnectorMasterTable
+WHERE NOT IsNull([__FK_history]);
+Drop Fields [__KEY_root], [__KEY_locations], [__FK_locations], __extra_ from history_recovered;
+Drop Fields [__FK_coordinates], latitude, longitude, country, country_code, province from history_recovered; 
+Drop Fields latest, latest_u0 from history_recovered;
+Drop Field [__FK_history] from history_recovered;
+
+auxData:
+CrossTable(auxDate, Recovered, 1)
+Load 
+	*
+Resident history_recovered;
+Drop table history_recovered;
+
+Left Join (Facts)
+LOAD Distinct
+	Floor(Num(Date#(auxDate))) as DateKey,
+	Date#(auxDate) as Date, 
+	Recovered,
+   	If(IsNull(Recovered) or (Recovered - Previous(Recovered) < 0) or IsNull(Recovered - Previous(Recovered)), 
+    		0, 
+        	Recovered - Previous(Recovered)) as DailyRecovered, 
+    	ApplyMap('Mapping_Confirmed_Province_CountryKey',
+     		ApplyMap('Mapping_Recovered_CountryKey_Province', CountryKey_aux, ''), '') as CountryKey
+RESIDENT auxData;
+DROP TABLE  auxData;
+DROP TABLE RestConnectorMasterTable;
+
+FinalFacts:
+NoConcatenate
+LOAD 
+	*,
+	Confirmed - Deaths - Recovered as Active
+RESIDENT Facts;
+DROP TABLE  Facts;
+RENAME TABLE  FinalFacts to Facts;
+
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+// Convert to Floor(Num(Date#(auxDateKey))) as DateKey, in all Facts tables
+Calendar:  
+LOAD Distinct
+	DateKey,
+	Date,  
+    	Week(Date)  			 	as [Week], 
+    	Month(Date) 			 	as [Month], 
+    	'Q' & Ceil(Month(Date)/3) 	 	as [Quarter],
+    	Year(Date)  			 	as [Year],  
+    	Month(Date) & ' Week ' &  Week(Date)  	as [Month Week]
+RESIDENT Facts
+ORDER BY DateKey desc;
+DROP FIELD Date from Facts;
+
+RestConnectorMasterTable:
+SQL SELECT 
+	"updatedAt",
+    	"__KEY_root"
+FROM JSON (wrap on) "root" PK "__KEY_root"
+WITH CONNECTION (  
+	URL "$(vBaseURL)"  
+);
+
+
+[System]:
+LOAD	
+	[updatedAt] as [Sys Updated At]
+RESIDENT RestConnectorMasterTable
+WHERE NOT IsNull([__KEY_root]);
+DROP TABLE RestConnectorMasterTable;
+
+
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+
+MAP_COUNTRYKEY_COUNTRY:
+Mapping
+LOAD DISTINCT
+	CountryKey as MapCountryKey,
+  Country    as MapCountry
+Resident locations;
+
+MAP_COUNTRY_COUNTRYKEY:
+Mapping
+LOAD DISTINCT
+	Country    as MapCountry,
+  CountryKey as MapCountryKey
+RESIDENT locations;
+
+AUX_AGGR_CONFIRMED_prev:
+NoConcatenate
+LOAD 
+    ApplyMap('MAP_COUNTRYKEY_COUNTRY', CountryKey, '') as AuxCountry,
+    DateKey                                            as AuxDateKey,
+    SUM(Confirmed)                                     as AuxConfirmed,
+    SUM(DailyConfirmed)                                as AuxDailyConfirmed
+RESIDENT Facts
+GROUP BY 
+	ApplyMap('MAP_COUNTRYKEY_COUNTRY', CountryKey, ''), 
+  DateKey
+ORDER BY CountryKey, DateKey
+;
+
+LET vMinNumConfirmedCases = 100;
+AUX_AGGR_CONFIRMED:
+NoConcatenate
+LOAD 
+	AuxCountry, 
+  AuxDailyConfirmed
+RESIDENT AUX_AGGR_CONFIRMED_prev
+WHERE AuxConfirmed > $(vMinNumConfirmedCases)
+;
+DROP TABLE AUX_AGGR_CONFIRMED_prev;
+
+
+DISTINCT_COUNTRIES:
+LOAD Distinct
+	Country as DistinctCountry
+RESIDENT locations;
+
+LET vCountryCount = FieldValueCount('DistinctCountry');
+FOR vCountryID = 0 TO ($(vCountryCount)-1)
+	LET vCountry = Peek('DistinctCountry', $(vCountryID), 'DISTINCT_COUNTRIES'); 
+
+	AUX_LOOP:
+  LOAD
+    AuxCountry,
+   	AuxDailyConfirmed, 
+    Floor(AutoNumber(RowNo(), AuxCountry)/7, 1) as AuxWeek1
+  RESIDENT AUX_AGGR_CONFIRMED
+  WHERE AuxCountry='$(vCountry)'
+  ;
+
+NEXT vCountryID
+DROP TABLE AUX_AGGR_CONFIRMED;
+
+
+AUX_FINAL:
+NoConcatenate
+LOAD 
+	AuxCountry,
+  AuxWeek1,
+  Avg(AuxDailyConfirmed) as AvgDailyConfirmed
+RESIDENT AUX_LOOP
+GROUP BY AuxCountry, AuxWeek1;
+DROP TABLE AUX_LOOP;
+
+
+Concatenate(Facts)
+LOAD
+	ApplyMap('MAP_COUNTRY_COUNTRYKEY', AuxCountry, '') as CountryKey, 
+  AuxWeek1,
+  AvgDailyConfirmed
+RESIDENT AUX_FINAL;
+DROP TABLE AUX_FINAL;
+
+
